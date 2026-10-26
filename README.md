@@ -62,6 +62,25 @@ prepares. Each uses your own account key, typed once and kept on the console.
 - **Updates itself**: a new version installs from the console, no PC needed
 - Made for the controller: <kbd>L1</kbd> <kbd>R1</kbd> to switch sections, <kbd>✕</kbd> to select, <kbd>○</kbd> to go back
 
+### Automatic debrid conversion
+
+Connect your accounts in **Downloads → Debrid services**. Catalog downloads first
+prepare supported, online hosts through Real-Debrid before downloading to the
+selected drive. TorBox is tried second if Real-Debrid is not configured, does not
+support the host, is offline, or cannot convert the link. A service is only used
+when its login/key is saved in settings.
+This includes individual sources in multi-part catalog releases. The queue shows
+the service preparing the link. Real-Debrid phone-login tokens renew automatically.
+
+Host lists are cached for five minutes. If neither configured service can convert
+the link, the original source's download/browser flow is preserved. TorBox transfers
+target sixteen connections, including saved/resumed jobs and pasted TorBox CDN links.
+Adaptive backoff and server-requested retry delays still apply if a CDN refuses traffic.
+Manually pasted links, captured final URLs, authenticated sources and split-file
+manifests retain their explicit routes. Catalog identity, checksums and archive
+passwords are preserved. Malformed one-byte CDN probes retry with a bounded
+16-byte prefix while retaining exact range checks.
+
 ## Install in four steps
 
 <p align="center">

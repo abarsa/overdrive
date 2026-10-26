@@ -36,6 +36,7 @@ function harness(options = {}) {
   const files = new Map();
   const dirs = new Set(['/data']);
   const enqueued = [];
+  const sourceContexts = [];
   const installs = [];
   const fs = {
     exists: path => dirs.has(path) || files.has(path),
@@ -82,7 +83,10 @@ function harness(options = {}) {
     dataDir: '/data', platform: 'desktop',
     archives: {streams: true, supportsAsyncInspection: false, inspect: () => ({kind: null})},
     notifications: {show() {}}, power: {keepAwake() {}},
-    sources: {resolve: async entry => ({url: entry.url})},
+    sources: {resolve: async (entry, context) => {
+      sourceContexts.push(context);
+      return {url: entry.url};
+    }},
     archiveAuth: auth,
   });
   const release = {
@@ -90,7 +94,7 @@ function harness(options = {}) {
     ...(options.unavailable ? {unavailableReason: options.unavailable} : {}),
   };
   const id = queue.enqueue({id: 'CUSA00009', title: 'Archive Game'}, release, '/data');
-  return {queue, id, files, enqueued, installs, auth};
+  return {queue, id, files, enqueued, installs, auth, sourceContexts};
 }
 
 async function settled(fixture) {
@@ -110,6 +114,7 @@ test('an Archive.org download carries the account cookie to the node it redirect
   assert.equal(fixture.enqueued[0].url, NODE);
   assert.equal(fixture.enqueued[0].headers.Cookie, COOKIE);
   assert.equal(fixture.enqueued[0].connections, 4, 'Archive.org takes four connections, not sixty-four');
+  assert.equal(fixture.sourceContexts[0].catalog, false, 'an authenticated archive retains its account route instead of automatic debrid conversion');
   assert.equal(fixture.installs.length, 0, 'the console cannot send the cookies: nothing is installed from the link');
   // The queue file keeps the job, never the session.
   const saved = fixture.files.get('/data/overdrive/downloads.json') || '';

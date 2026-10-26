@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -69,10 +70,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with self.guard:
                 first = ("refuse", self.headers["Range"]) not in self.retried
                 self.retried.add(("refuse", self.headers["Range"]))
-            # The first range's first answer is archive.org's HTML error page; it must not read as a web page.
-            if busy > 6 or (first and self.headers["Range"].startswith("bytes=0-")):
-                status = (500, 503, 429)[len(self.refused) % 3]
-                self.refused.append(status)
+                # Guarantee each refusal status even if fast requests do not overlap enough
+                # to exceed the concurrency threshold. Allocate the status under the same lock.
+                refuse = busy > 6 or (first and (len(self.refused) < 3 or self.headers["Range"].startswith("bytes=0-")))
+                if refuse:
+                    status = (500, 503, 429)[len(self.refused) % 3]
+                    self.refused.append(status)
+            # HTTP 500 carries an HTML error page; it must be retried rather than treated as a web page.
+            if refuse:
                 body = b"<html><body>Internal Server Error</body></html>" if status == 500 else b""
                 self.send_response(status)
                 if status == 503: self.send_header("Retry-After", "0")
@@ -140,6 +145,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         piece = re.search(r"/piece([0-2])$", path)
         payload = PIECES[int(piece[1])] if piece else LARGE if path == "/paced" else DATA
+        if path == "/one-byte-full-small":
+            payload = b"tiny"
         if path.endswith("-mutable") and self.mutated:
             payload = bytes(reversed(DATA))
         total = 4*1024**3 + 1024**2 if path == "/large-offset" else len(payload)
@@ -150,6 +157,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_error(416)
                 return
             start, end = map(int, match.groups())
+            if path.startswith("/one-byte-full"):
+                end = min(end, total-1)
             status = 206
         if (path == "/flaky" and selected != "bytes=0-0") or path == "/flaky-probe":
             with self.guard:
@@ -185,8 +194,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/changed" and selected != "bytes=0-0":
             status = 200
         changed_etag = path == "/changed-etag" and selected != "bytes=0-0"
+        # Real-Debrid's affected CDN sends the entire file for bytes=0-0 while
+        # claiming that its Content-Range contains only that byte.
+        full_probe = path.startswith("/one-byte-full") and selected == "bytes=0-0"
+        if path == "/one-byte-full-bad-body" and selected == "bytes=0-15":
+            full_probe = True
         self.send_response(status)
-        self.send_header("Content-Length", str(end-start+1))
+        self.send_header("Content-Length", str(total if full_probe else end-start+1))
         if "modified" in path:
             self.send_header("Last-Modified", self.modified)
             self.send_header("ETag", 'W/"weak"')
@@ -194,9 +208,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("ETag", '"fixture-v2"' if path == "/changed" or changed_etag else '"fixture-v1"')
         if status == 206:
             reported = start+1 if path == "/bad-range" and selected != "bytes=0-0" else start
+            if path == "/one-byte-full-bad-range" and selected == "bytes=0-15":
+                reported += 1
             self.send_header("Content-Range", f"bytes {reported}-{end}/{total}")
         self.end_headers()
         if head:
+            return
+        if full_probe:
+            self.wfile.write(payload)
+            return
+        if path == "/one-byte-full-truncated" and selected == "bytes=0-15":
+            self.wfile.write(payload[:8])
+            self.close_connection = True
             return
         if path == "/suspend" and selected != "bytes=0-0":
             with self.guard:
@@ -205,7 +228,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for offset in range(start, end+1, 65536):
                 index = offset % len(payload)
                 self.wfile.write(payload[index:index+min(65536, end-offset+1)])
-                if path.startswith("/slow") or path.startswith("/multipart-slow"):
+                if path.startswith(("/slow", "/multipart-slow", "/one-byte-full-slow")):
                     time.sleep(0.006)
                 if path == "/suspend":
                     time.sleep(0.02)
@@ -267,7 +290,7 @@ def compile_client(directory):
     subprocess.run(["clang++", "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread",
                     "-I", str(ROOT / "native/shared"), str(ROOT / "tools/tests/network_client.cpp"),
                     str(ROOT / "native/shared/network.cpp"), str(ROOT / "tools/tests/network_test_platform.cpp"),
-                    "-lcurl", "-o", str(binary)], check=True)
+                    "-lcurl", *([] if sys.platform == "darwin" else ["-lcrypto"]), "-o", str(binary)], check=True)
     return binary
 
 
@@ -319,6 +342,28 @@ def main():
         # Custom public Range headers still require the caller to inspect redirects explicitly.
         probe_redirect = run("/redirect", max_bytes=8192, range_probe=True)
         assert probe_redirect["status"] == 302 and probe_redirect["headers"]["location"] == "/file", probe_redirect
+
+        for endpoint, payload in (("/one-byte-full", DATA), ("/one-byte-full-small", b"tiny")):
+            before = len(Handler.requests)
+            path = directory / endpoint.removeprefix("/")
+            out = run(endpoint, path, digest=hashlib.sha256(payload).hexdigest())
+            assert out["state"] == "completed", out
+            assert path.read_bytes() == payload
+            ranges = [r[1] for r in Handler.requests[before:] if r[0] == endpoint]
+            assert ranges[:2] == ["bytes=0-0", "bytes=0-15"], ranges
+        for endpoint in ("/one-byte-full-bad-range", "/one-byte-full-bad-body", "/one-byte-full-truncated"):
+            path = directory / endpoint.removeprefix("/")
+            out = run(endpoint, path)
+            assert out["state"] == "failed" and not path.exists(), out
+        path = directory / "one-byte-mirror"
+        before = len(Handler.requests)
+        out = run("/file", path, mirrors=("/one-byte-full",), digest=hashlib.sha256(DATA).hexdigest())
+        assert out["state"] == "completed" and path.read_bytes() == DATA, out
+        assert any(r[:2] == ("/one-byte-full", "bytes=0-15") for r in Handler.requests[before:])
+        path = directory / "one-byte-resume"
+        assert run("/one-byte-full-slow-modified", path, connections=1, cancel=400)["state"] == "cancelled"
+        out = run("/one-byte-full-slow-modified", path, connections=1)
+        assert out["state"] == "completed" and path.read_bytes() == DATA, out
         redirect = run("/redirect", method="HEAD", no_redirect=True)
         assert redirect["status"] == 302 and redirect["headers"]["location"] == "/file", redirect
         for endpoint in ("/html", "/html-no-type", "/html-fragmented"):

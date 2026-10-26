@@ -86,7 +86,12 @@ task during cleanup if its lifetime belongs to that component.
 | `storageRoot` | omitted | Allowed absolute directory containing the destination; guards device/inode identity during writes and before publication |
 | `headers` | omitted | Up to 32 string header values; see HTTP restrictions below |
 
-A one-byte GET probe checks range support and size. A server that answers it with
+A one-byte GET probe checks range support and size. If a server claims a one-byte
+206 range but sends a larger body, the downloader retries with a 16-byte prefix.
+That response must match the requested span (clipped for files smaller than 16
+bytes), its declared length and its actual byte count; malformed or truncated
+responses still fail. The same fallback applies when validating mirrors.
+A server that answers the probe with
 a 206 range downloads in parallel and can resume. A strong ETag guards every range
 through `If-Range`; without one, `Last-Modified` does (weak ETags are ignored);
 without either, only the exact size and range bounds are checked. Ranges reuse the
@@ -254,6 +259,13 @@ delay from 0.5 s to 30 s, jitter, and numeric Retry-After honored up to a minute
 HTTP-date Retry-After is not supported. Each failed range logs its status,
 Content-Range, Content-Length, ETag, encoding and final URL.
 The default concurrency is a starting point, not a measured PS5 optimum.
+
+TorBox CDN targets (`tb-cdn.io`, `tb-cdn.st`, `tb-cdn.cx`, `tb-cdn.earth` and `torbox.app`,
+including subdomains) start at sixteen connections when requested by Overdrive.
+Other recognized debrid CDNs keep their eight-connection
+cap. Debrid retries honour numeric `Retry-After` up to 300 seconds. Overdrive also
+targets sixteen connections for converted TorBox jobs when enqueueing, including resumed
+jobs and multipart sources. Validate this policy with `python3 tools/test_network_policy.py`.
 
 The FIFO queue accepts eight unconsumed tasks, with **one task active at a time**;
 a large file uses multiple connections within that task. HTTP requests queued

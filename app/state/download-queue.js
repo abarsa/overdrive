@@ -10,6 +10,7 @@
 import { INCOMPLETE_PART, STALE_PARTIAL, cause } from '../downloads/errors.js';
 import { t } from '../i18n/core.js';
 import { archivePassword } from './archive-password.js';
+import { downloadConnections } from './download-connections.js';
 import { BrowserRequired, archiveRefusal, cancellation, createSourceResolver, sourceKind, webURL } from './download-sources.js';
 import { LINK_PREFIX, captureAnchor, linkForLog, otherSourceLink, validateCapturedLink } from './browser-links.js';
 import { readJSON } from './read-json.js';
@@ -410,6 +411,21 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
       destination: `${root2}/downloads/extracted/${release.filename}`,
       nextAction: "extracted"
     } : formats.artifact(release, root2);
+    function sourceOptions(job2, signal) {
+      const previous = job2.message;
+      const source = job2.currentSource || job2.release;
+      const authenticatedArchive = archiveAuth?.enabled?.() && archiveAuth.isArchive(source.browserUrl || source.url || "");
+      return {
+        signal, directURL: job2.directURL,
+        catalog: job2.gameId !== "link" && !job2.release.link && !authenticatedArchive,
+        onProgress(report) {
+          const percent = report && Number.isFinite(report.progress)
+            ? ` ${Math.round(Math.max(0, Math.min(1, report.progress)) * 100)}%` : "";
+          job2.message = report ? t("add.waitTitle", { service: report.service }) + percent : previous;
+          emit2();
+        }
+      };
+    }
     function restartsAfterStall(job2) {
       // The hosts whose gateway answers every range HTTP 503 for a while: DataNodes and FileKeeper
       // both. Named by kind too, since the resolved URL of a captured link need not be the gateway.
@@ -497,7 +513,9 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
     }
     function reresolve(job2) {
       const source2 = job2.parts ? job2.currentSource : job2.release;
-      if ((job2.reresolved || 0) >= 2 || ["direct", "browser", "datanodes", "buzzheavier", "manifest", "unavailable"].includes(sourceKind(source2))) return false;
+      const sourceJob = job2.parts ? job2.parts[job2.partIndex] : job2;
+      const converted = sourceJob?.viaTorbox || sourceJob?.viaRealDebrid;
+      if ((job2.reresolved || 0) >= 2 || !converted && ["direct", "browser", "datanodes", "buzzheavier", "manifest", "unavailable"].includes(sourceKind(source2))) return false;
       job2.reresolved = (job2.reresolved || 0) + 1;
       delete job2.options;
       if (job2.parts) delete job2.parts[job2.partIndex].options;
@@ -860,7 +878,9 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
             if (!job2.release.url && !job2.release.browserUrl) throw new Error("This release has no download URL.");
             // A pasted link may come from a service of the user's own (a qBittorrent's WebUI), whose
             // file is behind its password: the release carries the headers for it (link-download.js).
-            const resolved = job2.directURL || sourceKind(job2.release) !== "direct" ? await sources.resolve(job2.release, { signal, directURL: job2.directURL }) : { url: webURL(job2.release.url).url, headers: job2.release.headers };
+            const { viaTorbox, viaRealDebrid, ...resolved } = await sources.resolve(job2.release, sourceOptions(job2, signal));
+            job2.viaTorbox = viaTorbox === true;
+            job2.viaRealDebrid = viaRealDebrid === true;
             job2.options = {
               ...resolved,
               rejectHtml: true,
@@ -917,7 +937,7 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
         }
         // Archive.org's nodes shed parallel ranges when many arrive together (an HTTP 503 reads as
         // "Server is busy"): four connections there, the sixty-four the other hosts take.
-        const connections = job2.options.archive ? 4 : 64;
+        const connections = job2.options.archive ? 4 : downloadConnections(transfer, job2.viaTorbox);
         task = downloads.enqueue({ ...transfer, rejectHtml: true, mirrors: void 0, connections, adaptive: true, rangeBytes: job2.options.rangeBytes, destination: job2.downloadDestination, storageRoot: job2.root, recoverCompleted: true });
         active2.task = task;
         const stalled = stallWatch(job2, task);
@@ -1475,7 +1495,9 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
           const source2 = job2.release.parts[index].sources[part.sourceIndex || 0];
           job2.currentSource = source2;
           if (!part.options) {
-            const resolved = await sources.resolve(source2, { signal, directURL: job2.directURL });
+            const { viaTorbox, viaRealDebrid, ...resolved } = await sources.resolve(source2, sourceOptions(job2, signal));
+            part.viaTorbox = viaTorbox === true;
+            part.viaRealDebrid = viaRealDebrid === true;
             part.options = { ...resolved, expectedBytes: resolved.expectedBytes || source2.sizeBytes || void 0, sha256: source2.sha256 || void 0 };
             delete job2.directURL;
             change();
@@ -1495,7 +1517,7 @@ import { VIKING_PAGE_PREFIX, VIKING_PREFIX, describeVikingCapture, linkPageMetad
           const task = downloads.enqueue({
             ...part.options,
             rejectHtml: true,
-            connections: 64,
+            connections: downloadConnections(part.options, part.viaTorbox),
             adaptive: true,
             destination: part.destination,
             storageRoot: job2.root,

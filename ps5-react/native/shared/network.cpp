@@ -140,6 +140,13 @@ struct Transfer {
   CURLcode result = CURLE_OK;
 };
 
+bool valid_prefix_response(const Transfer& t) {
+  const auto length = std::min(t.probe_length, t.range_total);
+  return t.status == 206 && t.content_range && length && t.range_begin == 0 &&
+    t.range_end == length-1 && t.accepted == length &&
+    (!t.length_known || t.content_length == length);
+}
+
 bool valid_file_response(const Transfer& t) {
   const Job& job = *t.job;
   if (!t.encoding.empty() && t.encoding != "identity") return false;
@@ -587,9 +594,14 @@ bool host_in(const std::string& url, const char* const (&domains)[N]) {
   return false;
 }
 
-bool debrid_cdn(const std::string& url) {
-  static const char* const domains[] = {"tb-cdn.io", "real-debrid.com", "premiumize.me"};
+bool torbox_cdn(const std::string& url) {
+  static const char* const domains[] = {"tb-cdn.io", "tb-cdn.st", "tb-cdn.cx", "tb-cdn.earth", "torbox.app"};
   return host_in(url, domains);
+}
+
+bool debrid_cdn(const std::string& url) {
+  static const char* const domains[] = {"real-debrid.com", "premiumize.me"};
+  return torbox_cdn(url) || host_in(url, domains);
 }
 
 // FileKeeper's download gateways (edge01.fetchio.cc, tunnel<n>.dlproxy.uk) answer every range HTTP 503
@@ -599,6 +611,15 @@ bool debrid_cdn(const std::string& url) {
 bool connection_capped_gateway(const std::string& url) {
   static const char* const domains[] = {"fetchio.cc", "dlproxy.uk"};
   return host_in(url, domains);
+}
+
+unsigned connection_limit(const std::string& url, unsigned asked) {
+  return torbox_cdn(url) ? std::min(asked, 16u) : debrid_cdn(url) ? std::min(asked, 8u) :
+    connection_capped_gateway(url) ? std::min(asked, 16u) : asked;
+}
+
+unsigned initial_connections(const std::string& url, unsigned limit, bool adaptive) {
+  return adaptive ? std::min(torbox_cdn(url) ? 16u : 8u, limit) : limit;
 }
 
 // How long a waiter honours the server's Retry-After: the debrid CDNs send several minutes.
@@ -760,6 +781,7 @@ private:
   bool check_sample(Job& job);
   void verify_mirrors(Job& job);
   CURLcode perform_probe(Transfer& probe);
+  CURLcode perform_prefix_probe(Transfer& probe);
   bool configure(Transfer& t);
   void finish_transfer(Transfer& t);
   void snapshot(Job& job, unsigned allowed, Clock::time_point now, Clock::time_point& previous,
@@ -1118,14 +1140,30 @@ CURLcode Service::perform_probe(Transfer& probe) {
   return probe.job->cancelled ? CURLE_ABORTED_BY_CALLBACK : result;
 }
 
+CURLcode Service::perform_prefix_probe(Transfer& probe) {
+  probe.probe_from = 0; probe.probe_length = 1; probe.accepted = 0;
+  if (!configure(probe)) return CURLE_FAILED_INIT;
+  auto result = perform_probe(probe);
+  // Some CDNs (including Real-Debrid) send the whole file for bytes=0-0,
+  // despite a Content-Range claiming only that byte. Retry a bounded prefix;
+  // callers still validate its exact span, total and received byte count.
+  if (!probe.job->cancelled && result == CURLE_WRITE_ERROR &&
+      probe.error == "invalid range probe body" && probe.status == 206 &&
+      probe.content_range && probe.range_begin == 0 && probe.range_end == 0) {
+    platform_log("download: one-byte range response exceeded its bounds; retrying a 16-byte probe");
+    probe.probe_length = 16; probe.accepted = 0;
+    if (!configure(probe)) return CURLE_FAILED_INIT;
+    result = perform_probe(probe);
+  }
+  return result;
+}
+
 bool Service::probe_source(Job& job, unsigned source_index) {
   Transfer& probe = transfers_[0];
   probe.probe = true; probe.source = source_index;
   CURLcode result = CURLE_FAILED_INIT;
   for (unsigned attempt = 1;; ++attempt) {
-    probe.accepted = 0;
-    if (!configure(probe)) { job.fail(probe.error); return false; }
-    result = perform_probe(probe); probe.result = result;
+    result = perform_prefix_probe(probe); probe.result = result;
     if (job.cancelled) return false;
     const unsigned tries = std::max(1u, std::min(6u, attempt_limit(probe)));
     // A debrid CDN answering 429 at the probe is the one failure users report: its wait is logged in
@@ -1155,8 +1193,7 @@ bool Service::probe_source(Job& job, unsigned source_index) {
   }
   if (probe.status == 200 && result == CURLE_WRITE_ERROR && probe.error.empty()) {
     job.known = probe.length_known; job.total = probe.content_length;
-  } else if (result == CURLE_OK && probe.status == 206 && probe.content_range &&
-             probe.range_begin == 0 && probe.range_end == 0 && probe.accepted == 1) {
+  } else if (result == CURLE_OK && valid_prefix_response(probe)) {
     job.known = true; job.total = probe.range_total;
     if (!probe.etag.empty() && !probe.etag.starts_with("W/")) job.etag = probe.etag;
     else job.last_modified = probe.last_modified;
@@ -1198,8 +1235,7 @@ void Service::verify_mirrors(Job& job) {
     if (job.cancelled) break;
     job.mirrors.push_back(url);
     probe.probe = true; probe.source = 0; probe.mirror = static_cast<unsigned>(job.mirrors.size()); probe.accepted = 0;
-    const bool same = configure(probe) && perform_probe(probe) == CURLE_OK && probe.status == 206 && probe.content_range &&
-      probe.range_begin == 0 && probe.range_end == 0 && probe.range_total == job.total &&
+    const bool same = perform_prefix_probe(probe) == CURLE_OK && valid_prefix_response(probe) && probe.range_total == job.total &&
       (job.etag.empty() ? !job.request.sha256.empty() : probe.etag == job.etag);
     if (!same) {
       job.mirrors.pop_back();
@@ -1551,11 +1587,11 @@ void Service::run_job(const std::shared_ptr<Job>& job) {
     const bool debrid = debrid_cdn(target);
     const unsigned asked = !job->ranged ? 1 : !capped ? job->request.connections :
       std::min(std::max(static_cast<unsigned>(capped/(1024*1024)), 2u), job->request.connections);
-    // A debrid CDN counts connections per account and sheds the rest as 429, so it gets eight at
-    // most whatever the app asked for; every other host keeps the number the app set.
+    // The local TorBox policy starts at sixteen. Other debrid CDNs retain their eight-connection
+    // cap; adaptive backoff and Retry-After remain active when an origin refuses requests.
     const bool gateway = connection_capped_gateway(target);
-    const unsigned limit = debrid ? std::min(asked, 8u) : gateway ? std::min(asked, 16u) : asked;
-    const unsigned initial = job->request.adaptive ? std::min(8u, limit) : limit;
+    const unsigned limit = connection_limit(target, asked);
+    const unsigned initial = initial_connections(target, limit, job->request.adaptive);
     if (debrid && asked > limit) {
       platform_log(("download: " + host_of(target) + " is a debrid CDN: " + std::to_string(limit) +
         " connections instead of " + std::to_string(asked) + ", Retry-After honoured up to 300 s").c_str());
