@@ -96,6 +96,13 @@ test('a refused key is named as such, not as a host error', async () => {
   await assert.rejects(keyed(http).prepare(MAGNET), /rejected the API key/);
 });
 
+test('a free plan is named as such, not as a refused key', async () => {
+  // The console's own answer (2026-10-27): a good key, a free plan, and HTTP 403 like a bad key.
+  const http = server([{match: /\/v1\/api\/webdl\/createwebdownload$/, answer: () => ({status: 403,
+    body: {success: false, error: 'PLAN_RESTRICTED_FEATURE', detail: 'API feature not available on your plan. Please upgrade to a paid plan to access the API.', data: null}})}]);
+  await assert.rejects(keyed(http).prepare('https://vikingfile.com/f/5wFlMbm0lC'), /need a paid plan/);
+});
+
 test('a torrent TorBox could not fetch fails with its state', async () => {
   const http = server([
     {match: /createtorrent$/, answer: () => ({body: ok({torrent_id: 9})})},

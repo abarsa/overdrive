@@ -18,11 +18,21 @@ import { linkInput } from './link-download.js';
 
   var FAILED = /^(error|failed|missingfiles|uploaderror|downloaderror)$/i;
 
+  // The plan, not the key: TorBox answers this with HTTP 403, the same code as a refused key.
+  function planRestricted(json) {
+    const text = `${json?.error || ""} ${json?.detail || ""}`;
+    return /PLAN_RESTRICTED|not available on your plan/i.test(text);
+  }
+
   function message(json, status) {
     const detail = json && typeof json.detail === "string" ? json.detail.trim() : "";
     const error = json && typeof json.error === "string" ? json.error : "";
     if (/BAD_TOKEN|AUTH_ERROR|BAD_API_KEY|INVALID_TOKEN/i.test(error + detail))
       return "TorBox rejected the API key. Enter it again in the download settings.";
+    // A free plan gets 403 PLAN_RESTRICTED_FEATURE from webdl (found on the console, 2026-10-27):
+    // the key is good, so asking for it again would send the player in a circle.
+    if (planRestricted(json))
+      return "TorBox's web downloads need a paid plan. Upgrade the account or use another source.";
     if (/TOO_MANY|RATE_LIMIT/i.test(error + detail)) return "TorBox is rate limiting the key. Try again in a minute.";
     return detail || (error ? `TorBox: ${error}.` : `TorBox answered HTTP ${status}.`);
   }
@@ -98,9 +108,10 @@ import { linkInput } from './link-download.js';
       // without its query (requestdl carries the key there) and the body without the key in it.
       if (!response.ok || json?.success === false)
         console.log(`[torbox] ${path.split("?")[0]}: HTTP ${response.status} ${String(text).split(key).join("***").slice(0, 300)}`);
-      // Whatever the body says, these two are the key: the API has none of its own to refuse.
+      // Whatever the body says, these two are the key — unless the plan is the one refusing it.
       if (response.status === 401 || response.status === 403)
-        throw new Error("TorBox rejected the API key. Enter it again in the download settings.");
+        throw new Error(planRestricted(json) ? message(json, response.status)
+          : "TorBox rejected the API key. Enter it again in the download settings.");
       if (!json || typeof json !== "object") throw new Error(`TorBox answered HTTP ${response.status}.`);
       if (!json.success) throw new Error(message(json, response.status));
       return json.data;
