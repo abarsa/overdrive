@@ -114,7 +114,6 @@ jobs:
           (cd build-output && sha256sum ps5-link-capture-v0.8.elf browser-capture.elf > SHA256SUMS.txt)
           cp ps5-react/LICENSE ps5-react/LICENSE-ATTRIBUTION ps5-react/NOTICE build-output/
           cp ps5-react/native/ps5/payloads/browser/README.md build-output/BROWSER-CAPTURE-PROVENANCE.md
-          cp README-AR-v0.8.md build-output/README-AR.md
           printf '%s\n' \
             'RUN ONLY ps5-link-capture-v0.8.elf from Payload Manager.' \
             'The original browser-capture.elf is already embedded inside it.' \
