@@ -131,6 +131,32 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(state['browser_return'], 0)
         self.assertEqual(self.loader.received, b'\x7fELF')
 
+    def test_reject_origin_after_full_body(self):
+        """Reject a cross-site request cleanly even when headers/body arrive separately."""
+        payload = json.dumps({'url': PAGE, 'filename': ''}).encode()
+        headers = (
+            f'POST /api/start HTTP/1.1\r\n'
+            f'Host: 127.0.0.1:{self.http_port}\r\n'
+            'Origin: http://evil.localhost\r\n'
+            'Content-Type: application/json\r\n'
+            f'Content-Length: {len(payload)}\r\n'
+            'Connection: close\r\n\r\n'
+        ).encode()
+        with socket.create_connection(('127.0.0.1', self.http_port), timeout=5) as client:
+            client.settimeout(3)
+            client.sendall(headers)
+            time.sleep(.08)  # force separate reads on many systems
+            client.sendall(payload)
+            data = bytearray()
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+        self.assertIn(b'HTTP/1.1 403 Forbidden', data)
+        self.assertTrue(data.endswith(b'Cross-site request denied'), data[-100:])
+        self.assertEqual('idle', self.get('/api/status')['stage'])
+
     def test_invalid_input(self):
         for candidate in ('https://vik1ngfile.site.evil/f/jTxcioO1oV',
                           'http://vik1ngfile.site/f/jTxcioO1oV',
