@@ -160,7 +160,7 @@ static int connect_loader(void) {
     (void)setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
     memset(&dest,0,sizeof dest);
     dest.sin_family=AF_INET;dest.sin_port=htons((uint16_t)capture_port);
-    dest.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    dest.sin_addr.s_addr=htonl(0x7F000001u);
     if (connect(fd,(struct sockaddr *)&dest,sizeof dest)) { close(fd);return -1; }
     return fd;
 }
