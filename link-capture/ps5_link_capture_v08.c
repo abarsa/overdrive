@@ -348,15 +348,6 @@ static void request(int fd) {
         answer(fd,200,"application/json",status);return;
     }
     if(strcmp(method,"POST") || strcmp(path,"/api/start")){answer(fd,404,"text/plain","Not found");return;}
-    const char *origin=find_header(input,"Origin"),*host=find_header(input,"Host");
-    if(origin){
-        char got[160],allowed[160];
-        const char *o=strstr(origin,"\r\n"),*h=host?strstr(host,"\r\n"):NULL;
-        if(!o||!h||o-origin>=130||h-host>=115){answer(fd,403,"text/plain","Bad origin");return;}
-        snprintf(got,sizeof got,"%.*s",(int)(o-origin),origin);
-        snprintf(allowed,sizeof allowed,"http://%.*s",(int)(h-host),host);
-        if(strcmp(got,allowed)){answer(fd,403,"text/plain","Cross-site request denied");return;}
-    }
     const char *cl=find_header(input,"Content-Length");
     if(!cl){answer(fd,400,"text/plain","Content-Length required");return;}
     char *end;
@@ -371,6 +362,18 @@ static void request(int fd) {
     }
     if(used-headerlen<bodylen){answer(fd,400,"text/plain","Incomplete request");return;}
     body[bodylen]=0;
+    /* Read the complete request body before returning HTTP 403. Closing a TCP
+     * socket with unread request bytes can emit RST on Linux and cause clients
+     * to fail while reading the otherwise-correct 403 response body. */
+    const char *origin=find_header(input,"Origin"),*host=find_header(input,"Host");
+    if(origin){
+        char got[160],allowed[160];
+        const char *o=strstr(origin,"\r\n"),*h=host?strstr(host,"\r\n"):NULL;
+        if(!o||!h||o-origin>=130||h-host>=115){answer(fd,403,"text/plain","Bad origin");return;}
+        snprintf(got,sizeof got,"%.*s",(int)(o-origin),origin);
+        snprintf(allowed,sizeof allowed,"http://%.*s",(int)(h-host),host);
+        if(strcmp(got,allowed)){answer(fd,403,"text/plain","Cross-site request denied");return;}
+    }
     char url[MAX_PAGE],filename[156]="";
     if(get_string(body,"url",url,sizeof url) || !valid_page(url) ||
        (strstr(body,"\"filename\"") && get_string(body,"filename",filename,sizeof filename)) ||
