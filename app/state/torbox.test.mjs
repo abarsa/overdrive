@@ -72,6 +72,25 @@ test('a site TorBox does not support says so', async () => {
   await assert.rejects(keyed(http).prepare('https://example.com/file.pkg'), /site you are trying to download from is not supported/);
 });
 
+test('a refused call logs why, without the key or the link', async () => {
+  // The catalog resolves an unsupported host to "Conversion failed" and nothing else: app.log is the
+  // only place the reason can be read (the requestdl query carries the key, so it must never appear).
+  const http = server([{match: /createwebdownload$/, answer: () => ({status: 500,
+    body: {success: false, error: 'UNSUPPORTED_SITE', detail: 'test-key cannot fetch this link', data: null}})}]);
+  const lines = [];
+  const original = console.log;
+  console.log = line => lines.push(String(line));
+  try {
+    await assert.rejects(keyed(http).prepare('https://example.com/file.pkg'));
+  } finally {
+    console.log = original;
+  }
+  const logged = lines.join('\n');
+  assert.match(logged, /\[torbox\] \/v1\/api\/webdl\/createwebdownload: HTTP 500 /);
+  assert.match(logged, /UNSUPPORTED_SITE/);
+  assert.doesNotMatch(logged, /test-key/, 'the key never reaches the log');
+});
+
 test('a refused key is named as such, not as a host error', async () => {
   const http = server([{match: /createtorrent$/, answer: () => ({status: 401, body: {detail: 'Unauthorized'}})},]);
   await assert.rejects(keyed(http).prepare(MAGNET), /rejected the API key/);
