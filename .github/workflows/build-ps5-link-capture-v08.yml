@@ -1,0 +1,133 @@
+name: Build PS5 Link Capture v0.8 Single ELF
+
+# Put this file in a fork of MyLuxy/overdrive.
+# Builds Overdrive capture helper then embeds it in a single PS5 LAN controller ELF.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  one-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this Overdrive revision
+        uses: actions/checkout@v4
+
+      - name: Install compiler and utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 llvm-18 python3 file unzip
+
+      - name: Download and verify upstream-pinned PS5 SDK
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, stat, urllib.request, zipfile
+
+          root = pathlib.Path.cwd()
+          lock = json.loads((root / 'ps5-react/dependencies.lock.json').read_text())
+          sdk = lock['sdk']
+          url, expected = sdk['url'], sdk['sha256']
+          # Only the SDK pinned by the checked-out Overdrive source is used.
+          if not url.startswith('https://') or len(expected) != 64:
+              raise SystemExit('Invalid SDK lock entry')
+          folder = root / '.sdk'
+          folder.mkdir(exist_ok=True)
+          target = folder / 'ps5-sdk.zip'
+          req = urllib.request.Request(url, headers={'User-Agent':'ps5-link-capture-elf-build/0.5'})
+          h = hashlib.sha256()
+          with urllib.request.urlopen(req, timeout=90) as stream, target.open('wb') as out:
+              while True:
+                  data = stream.read(1024 * 1024)
+                  if not data:
+                      break
+                  out.write(data)
+                  h.update(data)
+          if h.hexdigest().lower() != expected.lower():
+              target.unlink(missing_ok=True)
+              raise SystemExit('SDK SHA256 mismatch; refusing to build')
+          with zipfile.ZipFile(target) as archive:
+              archive.extractall(folder)
+          bin_dir = folder / 'ps5-payload-sdk' / 'bin'
+          compiler = bin_dir / 'prospero-clang'
+          if not compiler.is_file():
+              raise SystemExit('SDK layout unexpected: prospero-clang not found')
+          for path in bin_dir.iterdir():
+              if path.is_file():
+                  path.chmod(path.stat().st_mode | stat.S_IXUSR)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              print('PS5_PAYLOAD_SDK=' + str((folder / 'ps5-payload-sdk').resolve()), file=env)
+              print('PS5_CLANG=/usr/bin/clang-18', file=env)
+              print('LLVM_CONFIG=/usr/bin/llvm-config-18', file=env)
+              print('USE_CCACHE=0', file=env)
+          PY
+
+      - name: Compile original browser-capture sources for PS5
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-output
+          browser=ps5-react/native/ps5/payloads/browser
+          test -f ps5-react/native/ps5/payloads/browser_capture.c
+          for part in browser_platform browser_scan browser_match browser_url; do
+            test -f "$browser/$part.c"
+          done
+          "$PS5_PAYLOAD_SDK/bin/prospero-clang" \
+            -std=gnu11 -O2 -Wall -Wextra -Werror \
+            -o build-output/browser-capture.elf \
+            ps5-react/native/ps5/payloads/browser_capture.c \
+            "$browser/browser_platform.c" \
+            "$browser/browser_scan.c" \
+            "$browser/browser_match.c" \
+            "$browser/browser_url.c" \
+            -lkernel_sys
+          test -s build-output/browser-capture.elf
+          test -f link-capture/ps5_link_capture_v08.c
+          test -f tools/embed_payload.py
+          python3 tools/embed_payload.py build-output/browser-capture.elf build-output/embedded_capture.c
+          "$PS5_PAYLOAD_SDK/bin/prospero-clang" \
+            -std=gnu11 -O2 -Wall -Wextra -Werror -pthread \
+            -o build-output/ps5-link-capture-v0.8.elf \
+            link-capture/ps5_link_capture_v08.c build-output/embedded_capture.c \
+            -lkernel_sys -lSceSystemService -lSceUserService -lpthread
+          test -s build-output/ps5-link-capture-v0.8.elf
+          file build-output/browser-capture.elf build-output/ps5-link-capture-v0.8.elf
+
+      - name: Host mock tests (no PS5 required)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -DHOST_SIM -std=gnu11 -O2 -Wall -Wextra -Werror -pthread \
+             -o /tmp/ps5-link-v08-host \
+             link-capture/ps5_link_capture_v08.c build-output/embedded_capture.c
+          LINK_CAPTURE_HOST_EXE=/tmp/ps5-link-v08-host \
+          LINK_CAPTURE_MOCK_ELF_SIZE="$(stat -c %s build-output/browser-capture.elf)" \
+            python3 -m unittest discover -s tests -v
+
+      - name: Pack single ELF and original licences
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd build-output && sha256sum ps5-link-capture-v0.8.elf browser-capture.elf > SHA256SUMS.txt)
+          cp ps5-react/LICENSE ps5-react/LICENSE-ATTRIBUTION ps5-react/NOTICE build-output/
+          cp ps5-react/native/ps5/payloads/browser/README.md build-output/BROWSER-CAPTURE-PROVENANCE.md
+          cp README-AR-v0.8.md build-output/README-AR.md
+          printf '%s\n' \
+            'RUN ONLY ps5-link-capture-v0.8.elf from Payload Manager.' \
+            'The original browser-capture.elf is already embedded inside it.' \
+            'Keep ELF Loader on PS5 port 9021 available.' \
+            'Firmware 13.42 has NOT been tested with this v0.8 combined ELF.' \
+            'Use on your own trusted private network; neither ELF is a CAPTCHA bypass.' \
+            'Captured links are UNVERIFIED and no auto-download occurs.' \
+            > build-output/IMPORTANT.txt
+          rm build-output/embedded_capture.c
+
+      - name: Downloadable build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps5-link-capture-v0.8-single-elf
+          path: build-output/
+          if-no-files-found: error
